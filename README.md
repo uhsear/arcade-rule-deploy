@@ -145,3 +145,4 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [gdbxray](https://github.com/uhsear/gdbxray) - read the attribute rules already in a geodatabase, with their Arcade text
+- [arcadecheck](https://github.com/uhsear/arcadecheck) - inventory the expressions before you migrate them
