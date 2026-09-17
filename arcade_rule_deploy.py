@@ -316,18 +316,66 @@ def preflight(planned, workspace, arcpy):
     return ok
 
 
-def existing_rule_names(path, arcpy):
-    """Names of calculation rules already on a table, upper-cased."""
-    names = set()
+def normalize_live_triggers(events):
+    """Live triggering events as an upper-case sorted tuple, or None if absent.
+
+    Both halves of this exist because of a wrong answer someone measured.
+    arcpy returns ['esriARTEInsert', 'esriARTEUpdate'] in an order that is not
+    the declared order, so comparing the raw sequence reports a difference that
+    is not one; and the esriARTE prefix appears in nobody's rules file.
+    None is not an empty tuple. A live rule exposing no triggeringEvents is
+    unknown, and calling it empty would report every rule as wrong.
+    """
+    if events is None:
+        return None
+    return tuple(sorted(str(t).upper().replace("ESRIARTE", "") for t in events))
+
+
+def rule_diffs(planned, live):
+    """How a live rule differs from the planned one. Empty when they agree.
+
+    Presence is not correctness. A rule moved from INSERT to UPDATE, or bound
+    to a neighbouring field, still answers to its name, so a name-only check
+    calls it clean while it no longer fires on the edit it was written for.
+    Field case is ignored because Describe echoes the case the field is stored
+    under, e.g. St_PreDir, which is not the case the rules file declares.
+    """
+    diffs = []
+    field = live.get("field")
+    if field and field.upper() != planned["field"].upper():
+        diffs.append("field expected %s, live %s" % (planned["field"], field))
+    expected = tuple(sorted(planned["triggers"]))
+    triggers = live.get("triggers")
+    if triggers is None:
+        diffs.append("triggers expected %s, live UNKNOWN (the rule exposed "
+                     "none)" % ";".join(expected))
+    elif triggers != expected:
+        diffs.append("triggers expected %s, live %s"
+                     % (";".join(expected), ";".join(triggers)))
+    return diffs
+
+
+def existing_rules(path, arcpy):
+    """Calculation rules already on a table, keyed by upper-case name.
+
+    The only place the live side is read, which is what keeps rule_diffs pure
+    and testable without a geodatabase.
+    """
+    found = {}
     try:
         desc = arcpy.Describe(path)
     except Exception:
-        return names
+        return found
     for rule in getattr(desc, "attributeRules", []) or []:
         rtype = str(getattr(rule, "type", "")).upper()
         if RULE_TYPE in rtype or not rtype:
-            names.add(str(rule.name).upper())
-    return names
+            found[str(rule.name).upper()] = {
+                "field": getattr(rule, "fieldName", None)
+                or getattr(rule, "field", None),
+                "triggers": normalize_live_triggers(
+                    getattr(rule, "triggeringEvents", None)),
+            }
+    return found
 
 
 def apply_rules(planned, workspace, arcpy):
@@ -366,7 +414,11 @@ def apply_rules(planned, workspace, arcpy):
 
 
 def verify(planned, workspace, arcpy):
-    """Confirm every planned rule is present on its table. True when all are."""
+    """Confirm every planned rule is present, on its field, on its triggers.
+
+    True when every rule matches. Checking the name alone is not enough: the
+    rule that goes wrong in practice is one a colleague edited in place.
+    """
     ok = True
     by_table = {}
     for p in planned:
@@ -378,14 +430,23 @@ def verify(planned, workspace, arcpy):
             ok = False
             _fail("table missing: %s" % table)
             continue
-        present = existing_rule_names(path, arcpy)
+        present = existing_rules(path, arcpy)
         for p in items:
-            if p["name"].upper() in present:
-                _ok("present: %s.%s" % (table, p["name"]))
-            else:
+            live = present.get(p["name"].upper())
+            if live is None:
                 ok = False
                 _fail("MISSING on %s: %s" % (table, p["name"]))
-        extra = present - {p["name"].upper() for p in items}
+                continue
+            diffs = rule_diffs(p, live)
+            if diffs:
+                ok = False
+                _fail("DIFF on %s: %s - %s"
+                      % (table, p["name"], "; ".join(diffs)))
+            else:
+                _ok("present and correct: %s.%s (field=%s triggers=%s)"
+                    % (table, p["name"], live["field"],
+                       ";".join(live["triggers"] or ())))
+        extra = set(present) - {p["name"].upper() for p in items}
         for name in sorted(extra):
             _warn("%s carries an unmanaged calculation rule: %s" % (table, name))
     return ok
@@ -395,6 +456,8 @@ def verify(planned, workspace, arcpy):
 
 def self_test():
     """Assertions over the pure core. No arcpy, no geodatabase, no network."""
+    import contextlib
+    import io
     import tempfile
 
     passed = [0]
@@ -554,6 +617,144 @@ def self_test():
     check(s["tables"] == ["A", "B"], "the summary lists each table once")
     check(s["refs"] == ["X", "Y"], "the summary lists each reference once")
     check(s["dynamic"] == 0, "the summary counts dynamic references")
+
+    # ---- verify compares field and triggers, not only the name
+    class _LiveRule(object):
+        """A rule as arcpy.Describe hands it back."""
+
+        def __init__(self, name, field, events, rtype="esriARTCalculation"):
+            self.name = name
+            self.type = rtype
+            self.fieldName = field
+            if events is not None:
+                self.triggeringEvents = events
+
+    class _Desc(object):
+        def __init__(self, rules):
+            self.attributeRules = rules
+
+    class _FakeArcpy(object):
+        """Just enough arcpy for verify: every path exists, one rule list."""
+
+        def __init__(self, rules):
+            self._rules = rules
+
+        def Exists(self, path):
+            return True
+
+        def Describe(self, path):
+            return _Desc(self._rules)
+
+    # The live side is read in one place, so these pin what it reads.
+    read = existing_rules("t", _FakeArcpy(
+        [_LiveRule("ar_LEFTZIP", "LeftZip", ["esriARTEInsert"]),
+         _LiveRule("ar_VALID", "LEFTZIP", ["esriARTEInsert"],
+                   "esriARTValidation")]))
+    check(sorted(read) == ["AR_LEFTZIP"],
+          "a validation rule on the same table is not one of ours")
+    check(read["AR_LEFTZIP"]["field"] == "LeftZip",
+          "the live field is read exactly as Describe spells it")
+    older = type("_OldRule", (object,), {"name": "ar_X", "field": "LEFTZIP",
+                                         "type": "esriARTCalculation"})()
+    check(existing_rules("t", _FakeArcpy([older]))["AR_X"]["field"] == "LEFTZIP",
+          "an arcpy build that spells it 'field' is still read")
+
+    class _Unreadable(object):
+        def Describe(self, path):
+            raise RuntimeError("cannot open")
+
+    check(existing_rules("t", _Unreadable()) == {},
+          "a table Describe cannot read yields no rules, never a false match"
+          "  <-- pinned defect")
+
+    check(normalize_live_triggers(["esriARTEInsert"]) == ("INSERT",),
+          "a live trigger loses the esriARTE prefix nobody declares")
+    check(normalize_live_triggers(["esriARTEUpdate", "esriARTEInsert"])
+          == ("INSERT", "UPDATE"),
+          "live triggers sort, so arcpy's order is not a difference"
+          "  <-- pinned defect")
+    check(normalize_live_triggers(None) is None,
+          "a rule exposing no triggeringEvents is unknown, not empty"
+          "  <-- pinned defect")
+
+    decl = {"field": "LEFTZIP", "triggers": ("INSERT",)}
+    check(rule_diffs(decl, {"field": "LEFTZIP", "triggers": ("INSERT",)}) == [],
+          "a matching field and trigger is no difference")
+    check(rule_diffs(decl, {"field": "LeftZip", "triggers": ("INSERT",)}) == [],
+          "Describe echoing the stored field case is no difference"
+          "  <-- pinned defect")
+    check(rule_diffs(decl, {"field": None, "triggers": ("INSERT",)}) == [],
+          "a rule exposing no field name is no field difference")
+    d = rule_diffs(decl, {"field": "RIGHTZIP", "triggers": ("INSERT",)})
+    check(len(d) == 1 and "RIGHTZIP" in d[0],
+          "a rule bound to another field is a difference  <-- pinned defect")
+    d = rule_diffs(decl, {"field": "LEFTZIP", "triggers": ("UPDATE",)})
+    check(len(d) == 1 and "UPDATE" in d[0],
+          "a rule switched from INSERT to UPDATE is a difference"
+          "  <-- pinned defect")
+    check(rule_diffs({"field": "F", "triggers": ("UPDATE", "INSERT")},
+                     {"field": "F", "triggers": ("INSERT", "UPDATE")}) == [],
+          "declared trigger order is no difference either")
+    d = rule_diffs(decl, {"field": "LEFTZIP", "triggers": None})
+    check(len(d) == 1 and "UNKNOWN" in d[0],
+          "unreadable triggers report UNKNOWN, never equal-to-empty"
+          "  <-- pinned defect")
+
+    vplan = plan(load_rules(write(
+        [{"table": "CENTERLINE", "name": "ar_LEFTZIP", "field": "LEFTZIP",
+          "triggers": "INSERT", "script": "return 1;"},
+         {"table": "CENTERLINE", "name": "ar_RIGHTZIP", "field": "RIGHTZIP",
+          "triggers": "INSERT", "script": "return 1;"}],
+        "verify.json")), "")
+
+    clean = _FakeArcpy([_LiveRule("ar_LEFTZIP", "LeftZip", ["esriARTEInsert"]),
+                        _LiveRule("ar_RIGHTZIP", "RIGHTZIP",
+                                  ["esriARTEInsert"])])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        clean_ok = verify(vplan, "ws", clean)
+    check(clean_ok is True,
+          "two correct rules verify clean, so --verify exits 0")
+
+    # The disaster: a colleague moves ar_LEFTZIP to UPDATE while chasing a slow
+    # insert, and binds the neighbouring rule to the wrong field. Both survive
+    # a name-only check.
+    drifted = _FakeArcpy([_LiveRule("ar_LEFTZIP", "LEFTZIP",
+                                    ["esriARTEUpdate"]),
+                          _LiveRule("ar_RIGHTZIP", "LEFTZIP",
+                                    ["esriARTEInsert"])])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        drift_ok = verify(vplan, "ws", drifted)
+    check(drift_ok is False,
+          "a rule moved to UPDATE fails verify, so --verify exits 1"
+          "  <-- pinned defect")
+    check(buf.getvalue().count("[FAIL] DIFF") == 2,
+          "two rules with different defects both report in one run")
+
+    # A rule deleted outright, beside one this file does not manage.
+    gone = _FakeArcpy([_LiveRule("ar_RIGHTZIP", "RIGHTZIP", ["esriARTEInsert"]),
+                       _LiveRule("ar_STRAY", "LEFTZIP", ["esriARTEInsert"])])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        gone_ok = verify(vplan, "ws", gone)
+    check(gone_ok is False,
+          "a deleted rule still fails verify  <-- pinned defect")
+    check("[FAIL] MISSING" in buf.getvalue(),
+          "a deleted rule reports MISSING, not DIFF")
+    check("[warn]" in buf.getvalue() and "AR_STRAY" in buf.getvalue(),
+          "a rule this file does not manage is a warning, not a failure")
+
+    # Same false green one table up: no table, so no rule can be checked.
+    class _NoTable(_FakeArcpy):
+        def Exists(self, path):
+            return False
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        no_table_ok = verify(vplan, "ws", _NoTable([]))
+    check(no_table_ok is False and "table missing" in buf.getvalue(),
+          "a workspace missing the table fails verify  <-- pinned defect")
 
     # ---- argument handling
     check(_parse(["--self-test"]).self_test, "--self-test parses")
