@@ -24,8 +24,11 @@ PASS  a variable dataset name is flagged dynamic
 PASS  a rule bound to another field is a difference  <-- pinned defect
 PASS  a rule switched from INSERT to UPDATE is a difference  <-- pinned defect
 PASS  a deleted rule still fails verify  <-- pinned defect
+...
+PASS  a unique prefix of --apply is refused, never read as --apply  <-- pinned defect
+PASS  --qualifier is read
 ------------------------------------------------------------------
-69 assertions, 0 failed
+70 assertions, 0 failed
 ```
 
 ## Requirements

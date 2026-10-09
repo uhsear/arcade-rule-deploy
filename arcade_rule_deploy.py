@@ -762,6 +762,15 @@ def self_test():
           "--apply defaults to off")
     check(not _parse(["--rules", "r.json", "--workspace", "w"]).verify,
           "--verify defaults to off")
+    # A unique prefix of --apply must not be read as --apply, or a typo writes.
+    refused = False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _parse(["--rules", "r.json", "--workspace", "w", "--ap"])
+    except SystemExit:
+        refused = True
+    check(refused and not _parse(["--rules", "r.json", "--workspace", "w"]).apply,
+          "a unique prefix of --apply is refused, never read as --apply  <-- pinned defect")
     check(_parse(["--rules", "r.json", "--workspace", "w",
                   "--qualifier", "G."]).qualifier == "G.",
           "--qualifier is read")
@@ -782,6 +791,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="arcade_rule_deploy.py",
+        allow_abbrev=False,
         description="Deploy Arcade calculation attribute rules to a "
                     "geodatabase, preflight-checked and idempotent.",
         epilog="Config precedence: flag > environment > default. The workspace "
