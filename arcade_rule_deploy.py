@@ -305,6 +305,13 @@ def preflight(planned, workspace, arcpy):
             else:
                 ok = False
                 _fail("target field missing: %s.%s" % (table, field))
+        # A collision is a warning, not a failure: two rules on one field
+        # can be deliberate. What must not happen is not knowing.
+        rules, known = run_order(
+            [p for p in planned if p["qualified_table"] == table],
+            existing_rules(path, arcpy))
+        for line in collision_lines(table, rules, known):
+            _warn(line)
 
     for p in planned:
         if p["dynamic_refs"]:
@@ -370,12 +377,112 @@ def existing_rules(path, arcpy):
         rtype = str(getattr(rule, "type", "")).upper()
         if RULE_TYPE in rtype or not rtype:
             found[str(rule.name).upper()] = {
+                "name": str(rule.name),
                 "field": getattr(rule, "fieldName", None)
                 or getattr(rule, "field", None),
                 "triggers": normalize_live_triggers(
                     getattr(rule, "triggeringEvents", None)),
+                "order": getattr(rule, "evaluationOrder", None),
+                "batch": bool(getattr(rule, "batch", False)),
             }
     return found
+
+
+def run_order(planned, live):
+    """Calculation rules on one table in the order they run after --apply.
+
+    Measured on Pro 3.6: a new rule takes the next evaluation order, and a
+    delete closes the gap. --apply deletes and re-adds every rule in the file,
+    in file order, so live rules the file does not name keep their relative
+    places at the front and the file's rules follow. A live rule the file names
+    is dropped here, because apply replaces it. Batch rules keep a separate
+    order and run when rules are evaluated, so they go last, unnumbered.
+
+    Returns (rules, known). known is False when a live immediate rule exposed
+    no evaluationOrder, because then no position can be stated.
+    """
+    names = set(p["name"].upper() for p in planned)
+    kept = [dict(v, source="live") for k, v in sorted(live.items())
+            if k not in names]
+    immediate = [r for r in kept if not r["batch"]]
+    known = all(r["order"] is not None for r in immediate)
+    immediate.sort(key=lambda r: r["order"] or 0)
+    ours = [{"name": p["name"], "field": p["field"], "triggers":
+             tuple(p["triggers"]), "batch": False, "source": "file"}
+            for p in planned]
+    return immediate + ours + [r for r in kept if r["batch"]], known
+
+
+def field_collisions(rules):
+    """Fields that two or more rules write on the same edit, in run order.
+
+    Returns a list of (field, rules on that field, {event: [rule names]}).
+    Only events two immediate rules share are listed, because rules on
+    different events never run on the same edit. A rule whose events are
+    unknown counts on every event: it cannot be ruled out. A batch rule
+    collides with any other rule on its field, since it rewrites the field
+    whenever rules are evaluated. Deliberately no winner is named: the last
+    rule to run can return the value an earlier one wrote, and this reads the
+    rule list, not the Arcade.
+    """
+    order = []
+    by_field = {}
+    for r in rules:
+        if not r["field"]:
+            continue
+        key = r["field"].upper()
+        if key not in by_field:
+            by_field[key] = []
+            order.append(key)
+        by_field[key].append(r)
+    out = []
+    for key in order:
+        group = by_field[key]
+        shared = {}
+        for event in VALID_TRIGGERS:
+            names = [r["name"] for r in group if not r["batch"]
+                     and (r["triggers"] is None or event in r["triggers"])]
+            if len(names) > 1:
+                shared[event] = names
+        if shared or (len(group) > 1 and any(r["batch"] for r in group)):
+            out.append((group[0]["field"], group, shared))
+    return out
+
+
+def collision_lines(table, rules, known):
+    """Warning text for every same-field collision on one table.
+
+    States the run position of each rule and the events they share, and says
+    in words that no value is predicted.
+    """
+    lines = []
+    immediate = [r for r in rules if not r["batch"]]
+    for field, group, shared in field_collisions(rules):
+        lines.append("COLLISION on %s.%s: %d rules write this field, in this "
+                     "evaluation order%s:"
+                     % (table, field, len(group),
+                        "" if known else " (UNKNOWN: a live rule exposed no "
+                        "evaluationOrder)"))
+        for r in group:
+            if r["batch"]:
+                pos = "batch"
+            elif known:
+                pos = "%d of %d" % (immediate.index(r) + 1, len(immediate))
+            else:
+                pos = "?"
+            lines.append("    %s. %s on %s, %s"
+                         % (pos, r["name"],
+                            ";".join(r["triggers"]) if r["triggers"]
+                            is not None else "UNKNOWN events",
+                            "from the rules file" if r["source"] == "file"
+                            else "already on the table"))
+        for event in VALID_TRIGGERS:
+            if event in shared:
+                lines.append("    on %s they run %s"
+                             % (event, ", then ".join(shared[event])))
+        lines.append("    No winner is claimed. A later rule can return the "
+                     "value an earlier one wrote.")
+    return lines
 
 
 def apply_rules(planned, workspace, arcpy):
@@ -449,6 +556,10 @@ def verify(planned, workspace, arcpy):
         extra = set(present) - {p["name"].upper() for p in items}
         for name in sorted(extra):
             _warn("%s carries an unmanaged calculation rule: %s" % (table, name))
+        # The live order, read back, is what proves the preflight prediction.
+        rules, known = run_order([], present)
+        for line in collision_lines(table, rules, known):
+            _warn(line)
     return ok
 
 
@@ -667,6 +778,9 @@ def self_test():
           "a table Describe cannot read yields no rules, never a false match"
           "  <-- pinned defect")
 
+    check(existing_rules("t", _FakeArcpy([_LiveRule("ar_N", "F", None)]))
+          ["AR_N"]["triggers"] is None,
+          "a live rule exposing no triggeringEvents is read as unknown")
     check(normalize_live_triggers(["esriARTEInsert"]) == ("INSERT",),
           "a live trigger loses the esriARTE prefix nobody declares")
     check(normalize_live_triggers(["esriARTEUpdate", "esriARTEInsert"])
@@ -756,6 +870,110 @@ def self_test():
     check(no_table_ok is False and "table missing" in buf.getvalue(),
           "a workspace missing the table fails verify  <-- pinned defect")
 
+    # ---- same-field collisions: report the order, claim no winner
+    def live(name, field, triggers, order, batch=False):
+        return {"name": name, "field": field, "triggers": triggers,
+                "order": order, "batch": batch}
+
+    def ours(name, field, triggers="INSERT"):
+        return {"name": name, "field": field,
+                "triggers": normalize_triggers(triggers)}
+
+    def names(rules):
+        return [r["name"] for r in rules]
+
+    got, known = run_order([ours("ar_A", "ZONE"), ours("ar_B", "ZONE")], {})
+    check(names(got) == ["ar_A", "ar_B"] and known,
+          "the file's rules run in file order, because apply adds them so")
+    # Measured on Pro 3.6: delete ar_A, add it again, and it runs after a
+    # rule it used to precede. Re-running the same deploy flipped the value.
+    got, known = run_order([ours("ar_A", "ZONE")],
+                           {"AR_A": live("ar_A", "ZONE", ("INSERT",), 1),
+                            "AR_KEEP": live("ar_KEEP", "ZONE", ("INSERT",), 2)})
+    check(names(got) == ["ar_KEEP", "ar_A"],
+          "a re-deployed rule moves behind the live rule it used to precede"
+          "  <-- pinned defect")
+    check(got[0]["source"] == "live" and got[1]["source"] == "file",
+          "each rule says whether it is live or from the rules file")
+    got, known = run_order([], {"AR_A": live("ar_A", "Z", ("INSERT",), 2),
+                                "AR_Z": live("ar_Z", "Z", ("INSERT",), 1)})
+    check(names(got) == ["ar_Z", "ar_A"],
+          "live rules follow evaluationOrder, not their names")
+    got, known = run_order([], {"AR_A": live("ar_A", "Z", ("INSERT",), 1),
+                                "AR_B": live("ar_B", "Z", ("INSERT",), None)})
+    check(known is False,
+          "a live rule with no evaluationOrder makes the order unknown")
+    got, known = run_order([ours("ar_F", "Z")],
+                           {"AR_BAT": live("ar_BAT", "Z", ("INSERT",), 1,
+                                           True)})
+    check(names(got) == ["ar_F", "ar_BAT"] and known,
+          "a batch rule goes last and does not spoil the immediate order")
+
+    def rule(name, field, triggers, batch=False, source="file"):
+        return {"name": name, "field": field, "triggers": triggers,
+                "batch": batch, "source": source}
+
+    c = field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                          rule("ar_B", "ZONE", ("INSERT", "UPDATE"))])
+    check(len(c) == 1 and c[0][2] == {"INSERT": ["ar_A", "ar_B"]},
+          "two rules on one field and one event collide on that event only")
+    check(field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                            rule("ar_B", "ZONE", ("UPDATE",))]) == [],
+          "rules on one field but different events never collide")
+    check(field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                            rule("ar_B", "CITY", ("INSERT",))]) == [],
+          "rules on different fields never collide")
+    check(len(field_collisions([rule("ar_A", "Zone", ("INSERT",)),
+                                rule("ar_B", "ZONE", ("INSERT",))])) == 1,
+          "field case does not hide a collision")
+    c = field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                          rule("ar_B", "ZONE", None, source="live")])
+    check(len(c) == 1 and c[0][2]["INSERT"] == ["ar_A", "ar_B"],
+          "a rule with unknown events is assumed to share them")
+    c = field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                          rule("ar_B", "ZONE", ("UPDATE",)),
+                          rule("ar_C", "ZONE", ("INSERT", "UPDATE"))])
+    check(len(c) == 1 and c[0][2] == {"INSERT": ["ar_A", "ar_C"],
+                                      "UPDATE": ["ar_B", "ar_C"]},
+          "three rules list each shared event with its own run order")
+    check(len(field_collisions([rule("ar_A", "ZONE", ("INSERT",)),
+                                rule("ar_BAT", "ZONE", ("INSERT",), True,
+                                     "live")])) == 1,
+          "a batch rule on the same field is a collision")
+    check(field_collisions([rule("ar_BAT", "ZONE", ("INSERT",), True)]) == [],
+          "a batch rule alone on its field is not a collision")
+    check(field_collisions([rule("ar_D", None, ("INSERT",)),
+                            rule("ar_E", None, ("INSERT",))]) == [],
+          "rules exposing no field are not matched to each other")
+
+    text = "\n".join(collision_lines("SITES", [
+        rule("ar_LEGACY", "ZONE", ("INSERT",), source="live"),
+        rule("ar_CITY", "CITY", ("INSERT",)),
+        rule("ar_ZONE", "Zone", ("INSERT", "UPDATE"))], True))
+    check("COLLISION on SITES.ZONE: 2 rules" in text,
+          "the warning names the table and the field")
+    check("1 of 3. ar_LEGACY" in text and "3 of 3. ar_ZONE" in text,
+          "the warning gives each rule its position among all rules on the "
+          "table")
+    check("already on the table" in text and "from the rules file" in text,
+          "the warning says which rule is live and which is being deployed")
+    check("on INSERT they run ar_LEGACY, then ar_ZONE" in text,
+          "the warning states the order on the shared event")
+    check("No winner is claimed" in text and "wins" not in text
+          and "kept" not in text,
+          "the warning claims no winner")
+    text = "\n".join(collision_lines("T", [
+        rule("ar_A", "ZONE", None, source="live"),
+        rule("ar_B", "ZONE", ("INSERT",)),
+        rule("ar_BAT", "ZONE", ("UPDATE",), True, "live")], False))
+    check("UNKNOWN: a live rule exposed no evaluationOrder" in text
+          and "?. ar_B" in text,
+          "an unknown order prints no position rather than a guessed one")
+    check("UNKNOWN events" in text and "batch. ar_BAT" in text,
+          "unknown events and batch rules are labelled, not numbered")
+    check(collision_lines("T", [rule("ar_A", "ZONE", ("INSERT",))], True)
+          == [], "one rule per field prints nothing")
+
     # ---- argument handling
     check(_parse(["--self-test"]).self_test, "--self-test parses")
     check(not _parse(["--rules", "r.json", "--workspace", "w"]).apply,
@@ -764,19 +982,272 @@ def self_test():
           "--verify defaults to off")
     # A unique prefix of --apply must not be read as --apply, or a typo writes.
     refused = False
+    usage_code = None
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             _parse(["--rules", "r.json", "--workspace", "w", "--ap"])
-    except SystemExit:
+    except SystemExit as exc:
         refused = True
+        usage_code = exc.code
     check(refused and not _parse(["--rules", "r.json", "--workspace", "w"]).apply,
           "a unique prefix of --apply is refused, never read as --apply  <-- pinned defect")
+    # argparse exits 2 on a usage error, and 2 here means apply partly failed.
+    check(usage_code == 64,
+          "a refused flag exits 64, not 2, which means apply partly failed"
+          "  <-- pinned defect")
     check(_parse(["--rules", "r.json", "--workspace", "w",
                   "--qualifier", "G."]).qualifier == "G.",
           "--qualifier is read")
 
+    # ---- the arcpy side, against a geodatabase held in memory. It keeps the
+    # evaluation order the way Pro 3.6 was measured to: a new rule goes last,
+    # a delete closes the gap.
+    class _Field(object):
+        def __init__(self, name, ftype="String"):
+            self.name = name
+            self.type = ftype
+
+    class _Management(object):
+        def __init__(self, gdb):
+            self.gdb = gdb
+            self.writes = 0
+
+        def DeleteAttributeRule(self, path, name, rtype):
+            rules = self.gdb.rules.get(os.path.basename(path), [])
+            for r in rules:
+                if r.name == name:
+                    self.writes += 1
+                    rules.remove(r)
+                    return
+            raise RuntimeError("rule %s does not exist" % name)
+
+        def AddAttributeRule(self, in_table, name, type, script_expression,
+                             is_editable, triggering_events, field,
+                             description):
+            if "BROKEN" in script_expression:
+                raise RuntimeError("the Arcade did not compile")
+            self.writes += 1
+            self.gdb.rules.setdefault(os.path.basename(in_table), []).append(
+                _LiveRule(name, field, ["esriARTE" + t.capitalize()
+                                        for t in triggering_events]))
+
+    class _Gdb(object):
+        def __init__(self, tables, refs=(), reachable=True):
+            self.tables = tables
+            self.refs = set(refs)
+            self.reachable = reachable
+            self.rules = {}
+            self.management = _Management(self)
+
+        def Exists(self, path):
+            name = os.path.basename(path)
+            if name == "ws":
+                return self.reachable
+            return name in self.tables or name in self.refs
+
+        def ListFields(self, path):
+            return self.tables[os.path.basename(path)]
+
+        def Describe(self, path):
+            rules = self.rules.get(os.path.basename(path), [])
+            for i, r in enumerate(rules):
+                r.evaluationOrder = i + 1
+            return _Desc(rules)
+
+    def sites():
+        return _Gdb({"SITES": [_Field("GlobalID", "GlobalID"),
+                               _Field("Zone")]}, ["ZONES"])
+
+    zone_rules = [
+        {"table": "SITES", "name": "ar_ZONE", "field": "ZONE",
+         "triggers": "INSERT;UPDATE",
+         "script": 'FeatureSetByName($datastore, "ZONES", ["N"], true)'},
+        {"table": "SITES", "name": "ar_ZONE_FIX", "field": "ZONE",
+         "triggers": "INSERT", "script": 'return "FIXED";'}]
+    zplan = plan(load_rules(write(zone_rules, "zone.json")), "")
+
+    def run(fn, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = fn(*args)
+        return result, out.getvalue()
+
+    gdb = sites()
+    gdb.rules["SITES"] = [_LiveRule("ar_ZONE", "ZONE", ["esriARTEInsert"]),
+                          _LiveRule("ar_LEGACY", "ZONE", ["esriARTEInsert"])]
+    ok, out = run(preflight, zplan, "ws", gdb)
+    check(ok is True and "[FAIL]" not in out,
+          "a clean workspace passes preflight with a collision on it")
+    check("[warn] COLLISION on SITES.ZONE: 3 rules" in out,
+          "preflight warns about the collision, live rule included")
+    check("1 of 3. ar_LEGACY" in out and "2 of 3. ar_ZONE on" in out
+          and "3 of 3. ar_ZONE_FIX" in out,
+          "preflight predicts the order apply will leave behind")
+    check(gdb.management.writes == 0,
+          "preflight writes nothing, collision or not")
+    failed_apply, out = run(apply_rules, zplan, "ws", gdb)
+    order = [(r.name, r.evaluationOrder)
+             for r in gdb.Describe("ws/SITES").attributeRules]
+    check(failed_apply == 0 and order == [("ar_LEGACY", 1), ("ar_ZONE", 2),
+                                          ("ar_ZONE_FIX", 3)],
+          "apply replaces the live rule and leaves the predicted order")
+    check("replaced existing ar_ZONE" in out and "ADDED 2 rule(s), 0 failed"
+          in out, "apply reports the replacement and the count")
+    ok, out = run(verify, zplan, "ws", gdb)
+    check(ok is True and "1 of 3. ar_LEGACY" in out
+          and "3 of 3. ar_ZONE_FIX" in out,
+          "verify reads the live order back and it matches the prediction")
+    check("on INSERT they run ar_LEGACY, then ar_ZONE, then ar_ZONE_FIX" in out
+          and "unmanaged calculation rule: AR_LEGACY" in out,
+          "verify reports the collision and the unmanaged rule, and passes")
+
+    broken = plan(load_rules(write(
+        [{"table": "SITES", "name": "ar_BAD", "field": "ZONE",
+          "script": "BROKEN"}], "broken.json")), "")
+    failed_apply, out = run(apply_rules, broken, "ws", sites())
+    check(failed_apply == 1 and "[FAIL] could not add ar_BAD" in out,
+          "a rule ArcGIS refuses is counted as failed, not added")
+
+    ok, out = run(preflight, zplan, "ws", _Gdb({}, reachable=False))
+    check(ok is False and "cannot reach workspace" in out,
+          "an unreachable workspace fails preflight before anything else")
+    bad = plan(load_rules(write(
+        [{"table": "SITES", "name": "ar_X", "field": "NOFIELD",
+          "script": 'FeatureSetByName($datastore, "NOPE", ["N"], true)'},
+         {"table": "GHOST", "name": "ar_Y", "field": "F",
+          "script": 'FeatureSetByName($datastore, name, ["N"], true)'},
+         {"table": "BARE", "name": "ar_Z", "field": "F", "script": "1"}],
+        "bad.json")), "")
+    ok, out = run(preflight, bad, "ws",
+                  _Gdb({"SITES": [_Field("GlobalID", "GlobalID")],
+                        "BARE": [_Field("F")]}))
+    check(ok is False and "referenced dataset MISSING: NOPE" in out,
+          "a missing referenced dataset fails preflight")
+    check("target table missing: GHOST" in out,
+          "a missing target table fails preflight")
+    check("no GlobalID field on BARE" in out,
+          "a table without a GlobalID fails preflight")
+    check("target field missing: SITES.NOFIELD" in out,
+          "a missing target field fails preflight")
+    check("ar_Y builds a dataset name at run time" in out,
+          "a dynamic reference is a warning in preflight")
+    check(has_dynamic_ref("FeatureSetByName($datastore)"),
+          "a call with no dataset argument is flagged dynamic")
+    raises(lambda: load_rules(write(["not an object"], "str.json")),
+           "not an object", "a rule that is not an object is rejected")
+    raises(lambda: load_rules(write(
+        [{"table": "T", "name": "n", "field": "f", "script": "s",
+          "triggers": " ; "}], "notrig.json")),
+        "no triggering events", "a rule with no triggering events is rejected")
+
+    # ---- arcpy import and the command line, end to end
+    env_keys = ("ARCADE_RULE_WORKSPACE", "ARCADE_RULE_QUALIFIER")
+    saved_mod = dict((k, v) for k, v in sys.modules.items() if k == "arcpy")
+    saved_env = dict((k, v) for k, v in os.environ.items() if k in env_keys)
+
+    def set_env(workspace):
+        for k in env_keys:
+            os.environ.pop(k, None)
+        if workspace:
+            os.environ["ARCADE_RULE_WORKSPACE"] = workspace
+
+    def cli(argv, arcpy=None):
+        sys.modules["arcpy"] = arcpy
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue() + err.getvalue()
+
+    zfile = os.path.join(tmp, "zone.json")
+    try:
+        set_env(None)
+        code, out = cli(["--rules", zfile, "--workspace", "ws"], None)
+        check("arcpy was not found" in str(code),
+              "without arcpy a real run stops and names the Pro Python")
+        code, out = cli(["--workspace", "ws"])
+        check(code == 64 and "--rules is required" in out,
+              "no --rules is a usage error, exit 64")
+        code, out = cli(["--rules", zfile])
+        check(code == 64 and "--workspace is required" in out,
+              "no workspace and no environment is a usage error, exit 64")
+        code, out = cli(["--rules", zfile, "--workspace", "ws", "--apply",
+                         "--verify"])
+        check(code == 64 and "separate runs" in out,
+              "--apply with --verify is refused, exit 64")
+        code, out = cli(["--rules", os.path.join(tmp, "dup.json"),
+                         "--workspace", "ws"])
+        check(code == 64 and "duplicate rule name" in out,
+              "a bad rules file is a usage error, exit 64")
+        gdb = sites()
+        code, out = cli(["--rules", zfile, "--workspace", "ws"], gdb)
+        check(code == 0 and "Check only" in out and "COLLISION" in out
+              and gdb.management.writes == 0,
+              "a check run warns, exits 0 and writes nothing")
+        set_env("ws")
+        code, out = cli(["--rules", zfile, "--apply"], gdb)
+        check(code == 0 and gdb.management.writes == 2,
+              "--apply writes, and the workspace comes from the environment")
+        code, out = cli(["--rules", zfile, "--verify"], gdb)
+        check(code == 0 and "present and correct" in out,
+              "--verify after --apply exits 0")
+        code, out = cli(["--rules", zfile, "--verify"], sites())
+        check(code == 1, "--verify with the rules absent exits 1")
+        code, out = cli(["--rules", os.path.join(tmp, "bad.json")],
+                        sites())
+        check(code == 1 and "Nothing was written" in out,
+              "a failed preflight exits 1 and writes nothing")
+        code, out = cli(["--rules", os.path.join(tmp, "broken.json"),
+                         "--apply"], sites())
+        check(code == 2, "a partly failed apply exits 2")
+    finally:
+        sys.modules.pop("arcpy", None)
+        sys.modules.update(saved_mod)
+        set_env(None)
+        os.environ.update(saved_env)
+
+    # ---- the harness itself. A check() that cannot record a failure would
+    # report every defect above as a pass. The probe's output is swallowed.
+    mark = len(failed)
+    with contextlib.redirect_stdout(io.StringIO()):
+        check(False, "probe: a false condition is a failure")
+        raises(lambda: None, "x", "probe: nothing raised is a failure")
+        raises(lambda: [][0], "x", "probe: the wrong exception is a failure")
+    probe = failed[mark:]
+    del failed[mark:]
+    check(len(probe) == 3,
+          "check() and raises() really do record a failure")
+    red, out = run(_tally, 1, ["probe one", "probe two"])
+    check(red == 1 and "3 assertions, 2 failed" in out
+          and "  FAILED: probe two" in out,
+          "the footer reports failures by count and by name, and exits 1")
+
+    # Importing the module runs nothing, so another script may use the core.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "arcade_rule_deploy_imported", os.path.abspath(__file__))
+    imported = importlib.util.module_from_spec(spec)
+    cache_before = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        _, out = run(spec.loader.exec_module, imported)
+    finally:
+        sys.dont_write_bytecode = cache_before
+    check(out == "" and imported.qualify("A", "G") == "G.A",
+          "importing the module prints nothing and exposes the core")
+
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    return _tally(passed[0], failed)
+
+
+def _tally(passed, failed):
+    """The self-test footer. Returns the exit code."""
     print("-" * 66)
-    total = passed[0] + len(failed)
+    total = passed + len(failed)
     if failed:
         print("%d assertions, %d failed" % (total, len(failed)))
         for f in failed:
@@ -811,6 +1282,12 @@ def _parse(argv):
                     help="report whether each rule is present, write nothing")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
+
+    def usage_error(message):
+        ap.print_usage(sys.stderr)
+        ap.exit(64, "%s: error: %s\n" % (ap.prog, message))
+
+    ap.error = usage_error
     return ap.parse_args(argv)
 
 
