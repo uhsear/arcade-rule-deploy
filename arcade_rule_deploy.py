@@ -6,9 +6,10 @@ rules needs --apply, and it is idempotent: a rule of the same name is removed
 before it is added, so re-running does not stack duplicates.
 
 The check that earns this tool: every FeatureSetByName("...") reference inside
-every script is resolved against the target workspace. ArcGIS accepts a rule
-whose referenced layer does not exist. Nothing complains at add time. The rule
-then returns empty at run time, quietly writing wrong values into production.
+every script is resolved against the target workspace before anything is
+written. On a file geodatabase, Pro 3.6 refuses an add whose table is missing
+(ERROR 002717), so an unchecked batch dies part way. An enterprise geodatabase
+was not measured.
 
     python arcade_rule_deploy.py --self-test
     python arcade_rule_deploy.py --rules rules.json --workspace prod.sde
@@ -49,9 +50,24 @@ IS_EDITABLE = "EDITABLE"
 # End of CONFIGURATION.
 # =============================================================================
 
+# A reference counts only when the quoted name is the whole argument. A name
+# joined to something else ("ZONES_" + yr) is built at run time, so it is not
+# matched here and has_dynamic_ref reports it instead.
 REF_PATTERN = re.compile(
-    r"(?:%s)\s*\(\s*[^,]+,\s*[\"']([^\"']+)[\"']" % "|".join(DATASET_REF_FUNCS)
+    r"\b(?:%s)\s*\(\s*[^,)]+,\s*[\"']([^\"']+)[\"']\s*[,)]"
+    % "|".join(DATASET_REF_FUNCS)
 )
+LITERAL_ARG = re.compile(r"\s*([\"'])[^\"']+\1\s*(?:,|$)")
+
+# A string literal is matched first and kept, so a "//" inside a string is not
+# taken for a comment. Only what is left over is a comment.
+COMMENT_PATTERN = re.compile(
+    r"(\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')|//[^\n]*|/\*.*?\*/", re.S
+)
+
+# A table value with a drive or a leading slash would make os.path.join drop
+# the workspace and send the write to another geodatabase.
+ABSOLUTE_TABLE = re.compile(r"^(?:[A-Za-z]:|[\\/])")
 
 PRO_PYTHON = (
     r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"
@@ -85,6 +101,15 @@ def _import_arcpy():
 
 # ----------------------------------------------------------------- pure core
 
+def strip_comments(script):
+    """The script with its // and /* */ comments blanked out.
+
+    A call that sits in a comment never runs, so checking it would fail a good
+    rule for a layer the script no longer reads.
+    """
+    return COMMENT_PATTERN.sub(lambda m: m.group(1) or " ", script or "")
+
+
 def extract_dataset_refs(script):
     """Dataset names a script names as string literals, in order, deduplicated.
 
@@ -92,7 +117,7 @@ def extract_dataset_refs(script):
     from a variable is invisible here and is reported by callers as unchecked.
     """
     seen = []
-    for name in REF_PATTERN.findall(script or ""):
+    for name in REF_PATTERN.findall(strip_comments(script)):
         if name not in seen:
             seen.append(name)
     return seen
@@ -101,16 +126,15 @@ def extract_dataset_refs(script):
 def has_dynamic_ref(script):
     """True when a dataset-reference call takes something other than a literal.
 
-    Such a rule can still be deployed, but preflight cannot prove its reference
-    resolves, so the caller warns instead of passing it silently.
+    A name joined to anything else counts too, since only its first piece is
+    visible. Such a rule can still be deployed, but preflight cannot prove its
+    reference resolves, so the caller warns instead of passing it silently.
     """
     for func in DATASET_REF_FUNCS:
-        for call in re.findall(r"%s\s*\(([^)]*)" % func, script or ""):
+        for call in re.findall(r"\b%s\s*\(([^)]*)" % func,
+                               strip_comments(script)):
             parts = call.split(",", 1)
-            if len(parts) < 2:
-                return True
-            arg = parts[1].strip()
-            if not (arg.startswith('"') or arg.startswith("'")):
+            if len(parts) < 2 or not LITERAL_ARG.match(parts[1]):
                 return True
     return False
 
@@ -120,7 +144,7 @@ def qualify(name, qualifier):
 
     A name that already carries a dot is assumed qualified and is left alone,
     which is what lets one rules file target a local test geodatabase (no
-    qualifier) and an enterprise one (say "GISOWNER.") without editing scripts.
+    qualifier) and an enterprise one (say "OWNER.") without editing scripts.
     """
     if not qualifier:
         return name
@@ -150,10 +174,11 @@ def load_rules(path):
     if not os.path.isfile(path):
         raise RuleFileError("rules file not found: %s" % path)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             raw = json.load(fh)
     except ValueError as exc:
-        raise RuleFileError("rules file is not valid JSON: %s" % exc)
+        raise RuleFileError(
+            "rules file is not valid JSON (it must be UTF-8): %s" % exc)
 
     if isinstance(raw, dict):
         raw = raw.get("rules", raw)
@@ -173,6 +198,13 @@ def load_rules(path):
         for key in ("table", "name", "field", "script"):
             if not item.get(key):
                 raise RuleFileError("%s is missing '%s'" % (where, key))
+            if not isinstance(item[key], str):
+                raise RuleFileError("%s: '%s' must be a JSON string"
+                                    % (where, key))
+        if ABSOLUTE_TABLE.match(item["table"]):
+            raise RuleFileError(
+                "%s: 'table' must be relative to --workspace, not a path "
+                "with a drive or a leading slash" % where)
         triggers = normalize_triggers(item.get("triggers", "INSERT"))
         if not triggers:
             raise RuleFileError("%s has no triggering events" % where)
@@ -206,10 +238,14 @@ def load_rules(path):
 def plan(rules, qualifier):
     """Resolve every rule to the paths preflight and apply will use."""
     out = []
+    spelling = {}
     for r in rules:
         refs = [qualify(n, qualifier) for n in extract_dataset_refs(r["script"])]
         item = dict(r)
-        item["qualified_table"] = qualify(r["table"], qualifier)
+        # ArcGIS table names ignore case, so Sites and SITES are one table. The
+        # first spelling stands for it, or rules on it would never be compared.
+        table = qualify(r["table"], qualifier)
+        item["qualified_table"] = spelling.setdefault(table.lower(), table)
         item["refs"] = refs
         item["dynamic_refs"] = has_dynamic_ref(r["script"])
         out.append(item)
@@ -265,8 +301,8 @@ def preflight(planned, workspace, arcpy):
         else:
             ok = False
             _fail(
-                "referenced dataset MISSING: %s. ArcGIS would accept the rule "
-                "and return empty at run time." % ref
+                "referenced dataset MISSING: %s. The add can fail part way "
+                "through the batch." % ref
             )
 
     fields_by_table = {}
@@ -307,10 +343,23 @@ def preflight(planned, workspace, arcpy):
                 _fail("target field missing: %s.%s" % (table, field))
         # A collision is a warning, not a failure: two rules on one field
         # can be deliberate. What must not happen is not knowing.
-        rules, known = run_order(
-            [p for p in planned if p["qualified_table"] == table],
-            existing_rules(path, arcpy))
-        for line in collision_lines(table, rules, known):
+        live = existing_rules(path, arcpy)
+        if live is None:
+            _warn("the rules already on %s could not be read, so collisions "
+                  "with them and the evaluation order are UNKNOWN" % table)
+        mine = [p for p in planned if p["qualified_table"] == table]
+        # ArcGIS refuses a duplicate name without case but deletes by exact
+        # case, so a live rule in another case can be neither replaced nor
+        # added beside. Measured on Pro 3.6: ERROR 002556 and ERROR 002541.
+        for p in mine:
+            old = (live or {}).get(p["name"].upper())
+            if old and old["name"] != p["name"]:
+                ok = False
+                _fail("rule name %s differs only in case from the live rule "
+                      "%s on %s. Apply could neither replace nor add it."
+                      % (p["name"], old["name"], table))
+        rules, known = run_order(mine, live or {})
+        for line in collision_lines(table, rules, known and live is not None):
             _warn(line)
 
     for p in planned:
@@ -335,7 +384,11 @@ def normalize_live_triggers(events):
     """
     if events is None:
         return None
-    return tuple(sorted(str(t).upper().replace("ESRIARTE", "") for t in events))
+    if isinstance(events, str):
+        # arcpy documents the property as a string. Do not split it by letter.
+        events = re.split(r"[;,]", events)
+    return tuple(sorted(str(t).strip().upper().replace("ESRIARTE", "")
+                        for t in events))
 
 
 def rule_diffs(planned, live):
@@ -344,13 +397,25 @@ def rule_diffs(planned, live):
     Presence is not correctness. A rule moved from INSERT to UPDATE, or bound
     to a neighbouring field, still answers to its name, so a name-only check
     calls it clean while it no longer fires on the edit it was written for.
+    A disabled rule keeps its name, field and events yet never fires. A missing
+    field is unknown, as missing events are, and unknown is not verified.
     Field case is ignored because Describe echoes the case the field is stored
-    under, e.g. St_PreDir, which is not the case the rules file declares.
+    under, e.g. Zone_L, which is not the case the rules file declares.
     """
     diffs = []
+    if "name" in live and live["name"] != planned["name"]:
+        diffs.append("name expected %s, live %s (ArcGIS deletes rules by "
+                     "exact case)" % (planned["name"], live["name"]))
     field = live.get("field")
-    if field and field.upper() != planned["field"].upper():
+    if not field:
+        diffs.append("field expected %s, live UNKNOWN (the rule exposed none)"
+                     % planned["field"])
+    elif field.upper() != planned["field"].upper():
         diffs.append("field expected %s, live %s" % (planned["field"], field))
+    if live.get("enabled") is False:
+        diffs.append("the rule is disabled and does not fire")
+    if live.get("batch"):
+        diffs.append("the rule is a batch rule, this tool adds immediate rules")
     expected = tuple(sorted(planned["triggers"]))
     triggers = live.get("triggers")
     if triggers is None:
@@ -366,13 +431,14 @@ def existing_rules(path, arcpy):
     """Calculation rules already on a table, keyed by upper-case name.
 
     The only place the live side is read, which is what keeps rule_diffs pure
-    and testable without a geodatabase.
+    and testable without a geodatabase. Returns None when the table cannot be
+    described: "no rules" and "could not look" must not read alike.
     """
     found = {}
     try:
         desc = arcpy.Describe(path)
     except Exception:
-        return found
+        return None
     for rule in getattr(desc, "attributeRules", []) or []:
         rtype = str(getattr(rule, "type", "")).upper()
         if RULE_TYPE in rtype or not rtype:
@@ -384,6 +450,7 @@ def existing_rules(path, arcpy):
                     getattr(rule, "triggeringEvents", None)),
                 "order": getattr(rule, "evaluationOrder", None),
                 "batch": bool(getattr(rule, "batch", False)),
+                "enabled": getattr(rule, "isEnabled", None),
             }
     return found
 
@@ -461,8 +528,8 @@ def collision_lines(table, rules, known):
         lines.append("COLLISION on %s.%s: %d rules write this field, in this "
                      "evaluation order%s:"
                      % (table, field, len(group),
-                        "" if known else " (UNKNOWN: a live rule exposed no "
-                        "evaluationOrder)"))
+                        "" if known else " (UNKNOWN: the live evaluation "
+                        "order could not be read)"))
         for r in group:
             if r["batch"]:
                 pos = "batch"
@@ -470,10 +537,12 @@ def collision_lines(table, rules, known):
                 pos = "%d of %d" % (immediate.index(r) + 1, len(immediate))
             else:
                 pos = "?"
+            if r["triggers"] is None:
+                events = "UNKNOWN events"
+            else:
+                events = ";".join(r["triggers"]) or "no events"
             lines.append("    %s. %s on %s, %s"
-                         % (pos, r["name"],
-                            ";".join(r["triggers"]) if r["triggers"]
-                            is not None else "UNKNOWN events",
+                         % (pos, r["name"], events,
                             "from the rules file" if r["source"] == "file"
                             else "already on the table"))
         for event in VALID_TRIGGERS:
@@ -503,7 +572,9 @@ def apply_rules(planned, workspace, arcpy):
                 type=RULE_TYPE,
                 script_expression=p["script"],
                 is_editable=IS_EDITABLE,
-                triggering_events=list(p["triggers"]),
+                # Documented as a String such as "INSERT;UPDATE". A list also
+                # worked on Pro 3.6, but the documented form is the safe one.
+                triggering_events=";".join(p["triggers"]),
                 field=p["field"],
                 description=p["description"] or None,
             )
@@ -538,6 +609,10 @@ def verify(planned, workspace, arcpy):
             _fail("table missing: %s" % table)
             continue
         present = existing_rules(path, arcpy)
+        if present is None:
+            ok = False
+            _fail("cannot read the rules on %s" % table)
+            continue
         for p in items:
             live = present.get(p["name"].upper())
             if live is None:
@@ -555,7 +630,8 @@ def verify(planned, workspace, arcpy):
                        ";".join(live["triggers"] or ())))
         extra = set(present) - {p["name"].upper() for p in items}
         for name in sorted(extra):
-            _warn("%s carries an unmanaged calculation rule: %s" % (table, name))
+            _warn("%s carries an unmanaged calculation rule: %s"
+                  % (table, present[name]["name"]))
         # The live order, read back, is what proves the preflight prediction.
         rules, known = run_order([], present)
         for line in collision_lines(table, rules, known):
@@ -616,6 +692,32 @@ def self_test():
     check(extract_dataset_refs('var t = "FeatureSetByName not a call";') == [],
           "the function name inside a string is not a reference")
 
+    # A call in a comment never runs. Checking it failed a good rule.
+    check(extract_dataset_refs('// old: FeatureSetByName($datastore, "OLD", [], true)\n'
+                               'return 1;') == [],
+          "a reference in a // comment is not a reference  <-- pinned defect")
+    check(extract_dataset_refs('/* FeatureSetByName($datastore, "OLD", [], true)\n'
+                               '*/ return 1;') == [],
+          "a reference in a /* */ comment is not a reference  <-- pinned defect")
+    check(extract_dataset_refs('var u = "http://x"; // note\n'
+                               'FeatureSetByName($datastore, "LIVE", [], true)')
+          == ["LIVE"], "a // inside a string is not a comment")
+    check(not has_dynamic_ref('// FeatureSetByName($datastore, nm, [], true)'),
+          "a dynamic call in a comment is not flagged")
+    # A name joined to something else is built at run time.
+    concat = 'FeatureSetByName($datastore, "ZONES_" + yr, ["A"], true)'
+    check(extract_dataset_refs(concat) == [] and has_dynamic_ref(concat),
+          "a literal joined to a variable is dynamic, not the literal  "
+          "<-- pinned defect")
+    check(has_dynamic_ref('FeatureSetByName($datastore, "A" + Left(x, 2), [], 1)'),
+          "a literal joined to a call is dynamic")
+    check(extract_dataset_refs('FeatureSetByName($datastore, "TAIL")')
+          == ["TAIL"] and not has_dynamic_ref('FeatureSetByName($datastore, "TAIL")'),
+          "a literal that ends the call is still a reference")
+    check(extract_dataset_refs('MyFeatureSetByName($datastore, "X", [], true)')
+          == [] and not has_dynamic_ref('MyFeatureSetByName($datastore, v)'),
+          "a longer function name is not a reference  <-- pinned defect")
+
     # ---- dynamic references are reported, not silently passed
     check(has_dynamic_ref('FeatureSetByName($datastore, layerName, ["A"], true)'),
           "a variable dataset name is flagged dynamic")
@@ -625,11 +727,11 @@ def self_test():
           "a script with no reference is not flagged dynamic")
 
     # ---- qualifier, what lets one file target test and production
-    check(qualify("ROADS", "GISOWNER.") == "GISOWNER.ROADS",
+    check(qualify("ROADS", "OWNER.") == "OWNER.ROADS",
           "an unqualified name takes the qualifier")
-    check(qualify("ROADS", "GISOWNER") == "GISOWNER.ROADS",
+    check(qualify("ROADS", "OWNER") == "OWNER.ROADS",
           "a qualifier without a trailing dot still works")
-    check(qualify("OTHER.ROADS", "GISOWNER.") == "OTHER.ROADS",
+    check(qualify("OTHER.ROADS", "OWNER.") == "OTHER.ROADS",
           "an already-qualified name is left alone")
     check(qualify("ROADS", "") == "ROADS", "an empty qualifier changes nothing")
     check(qualify("ROADS", None) == "ROADS", "no qualifier changes nothing")
@@ -695,6 +797,42 @@ def self_test():
         "dup.json")),
         "duplicate rule name", "two rules with one name on a table are rejected")
 
+    # Values of the wrong JSON type end in a usage error, not a traceback.
+    raises(lambda: load_rules(write(
+        [{"table": "T", "name": "n", "field": "f", "script": ["a", "b"]}],
+        "listscript.json")),
+        "must be a json string", "a script given as a list is rejected"
+        "  <-- pinned defect")
+    raises(lambda: load_rules(write(
+        [{"table": 5, "name": "n", "field": "f", "script": "s"}],
+        "numtable.json")),
+        "must be a json string", "a numeric table is rejected")
+    raises(lambda: load_rules(write(
+        [{"table": "T", "name": 5, "field": "f", "script": "s"}],
+        "numname.json")),
+        "must be a json string", "a numeric rule name is rejected")
+    # os.path.join drops the workspace when the table is absolute.
+    raises(lambda: load_rules(write(
+        [{"table": "C:\\data\\other.gdb\\SITES", "name": "n", "field": "f",
+          "script": "s"}], "drive.json")),
+        "relative to --workspace", "a table with a drive letter is rejected"
+        "  <-- pinned defect")
+    raises(lambda: load_rules(write(
+        [{"table": "/data/SITES", "name": "n", "field": "f", "script": "s"}],
+        "slash.json")),
+        "relative to --workspace", "a table with a leading slash is rejected")
+    # Windows PowerShell saves UTF-8 with a BOM. UTF-16 is not UTF-8 at all.
+    bom = os.path.join(tmp, "bom.json")
+    with open(bom, "wb") as fh:
+        fh.write(b"\xef\xbb\xbf" + json.dumps(good).encode("utf-8"))
+    check(len(load_rules(bom)) == 1,
+          "a rules file saved with a UTF-8 BOM loads  <-- pinned defect")
+    utf16 = os.path.join(tmp, "utf16.json")
+    with open(utf16, "wb") as fh:
+        fh.write(json.dumps(good).encode("utf-16"))
+    raises(lambda: load_rules(utf16), "valid json",
+           "a UTF-16 rules file is refused")
+
     two_tables = load_rules(write(
         [{"table": "A", "name": "same", "field": "f", "script": "s"},
          {"table": "B", "name": "same", "field": "f", "script": "s"}],
@@ -703,10 +841,10 @@ def self_test():
           "the same rule name on two different tables is allowed")
 
     # ---- planning
-    planned = plan(load_rules(write(good)), "GISOWNER.")
-    check(planned[0]["qualified_table"] == "GISOWNER.ROADS",
+    planned = plan(load_rules(write(good)), "OWNER.")
+    check(planned[0]["qualified_table"] == "OWNER.ROADS",
           "the plan qualifies the target table")
-    check(planned[0]["refs"] == ["GISOWNER.ZIPS"],
+    check(planned[0]["refs"] == ["OWNER.ZIPS"],
           "the plan qualifies the referenced dataset")
     check(not planned[0]["dynamic_refs"], "a literal reference is not dynamic")
 
@@ -728,17 +866,37 @@ def self_test():
     check(s["tables"] == ["A", "B"], "the summary lists each table once")
     check(s["refs"] == ["X", "Y"], "the summary lists each reference once")
     check(s["dynamic"] == 0, "the summary counts dynamic references")
+    s = summarize(plan(load_rules(write(
+        [{"table": "A", "name": "r1", "field": "f",
+          "script": 'FeatureSetByName($datastore, nm, ["a"], true)'},
+         {"table": "A", "name": "r2", "field": "g", "script": "1"},
+         {"table": "A", "name": "r3", "field": "h",
+          "script": 'FeatureSetByName($datastore, "P" + q, ["a"], true)'}],
+        "dyn.json")), ""))
+    check(s["dynamic"] == 2,
+          "the summary counts each rule with a dynamic reference")
+    spell = plan(load_rules(write(
+        [{"table": "Sites", "name": "r1", "field": "f", "script": "1"},
+         {"table": "SITES", "name": "r2", "field": "f", "script": "1"}],
+        "spell.json")), "")
+    check(summarize(spell)["tables"] == ["Sites"]
+          and spell[1]["qualified_table"] == "Sites",
+          "table names that differ only in case are one table"
+          "  <-- pinned defect")
 
     # ---- verify compares field and triggers, not only the name
     class _LiveRule(object):
         """A rule as arcpy.Describe hands it back."""
 
-        def __init__(self, name, field, events, rtype="esriARTCalculation"):
+        def __init__(self, name, field, events, rtype="esriARTCalculation",
+                     enabled=None):
             self.name = name
             self.type = rtype
             self.fieldName = field
             if events is not None:
                 self.triggeringEvents = events
+            if enabled is not None:
+                self.isEnabled = enabled
 
     class _Desc(object):
         def __init__(self, rules):
@@ -758,24 +916,24 @@ def self_test():
 
     # The live side is read in one place, so these pin what it reads.
     read = existing_rules("t", _FakeArcpy(
-        [_LiveRule("ar_LEFTZIP", "LeftZip", ["esriARTEInsert"]),
-         _LiveRule("ar_VALID", "LEFTZIP", ["esriARTEInsert"],
+        [_LiveRule("ar_ZONE_L", "Zone_L", ["esriARTEInsert"]),
+         _LiveRule("ar_VALID", "ZONE_L", ["esriARTEInsert"],
                    "esriARTValidation")]))
-    check(sorted(read) == ["AR_LEFTZIP"],
+    check(sorted(read) == ["AR_ZONE_L"],
           "a validation rule on the same table is not one of ours")
-    check(read["AR_LEFTZIP"]["field"] == "LeftZip",
+    check(read["AR_ZONE_L"]["field"] == "Zone_L",
           "the live field is read exactly as Describe spells it")
-    older = type("_OldRule", (object,), {"name": "ar_X", "field": "LEFTZIP",
+    older = type("_OldRule", (object,), {"name": "ar_X", "field": "ZONE_L",
                                          "type": "esriARTCalculation"})()
-    check(existing_rules("t", _FakeArcpy([older]))["AR_X"]["field"] == "LEFTZIP",
+    check(existing_rules("t", _FakeArcpy([older]))["AR_X"]["field"] == "ZONE_L",
           "an arcpy build that spells it 'field' is still read")
 
     class _Unreadable(object):
         def Describe(self, path):
             raise RuntimeError("cannot open")
 
-    check(existing_rules("t", _Unreadable()) == {},
-          "a table Describe cannot read yields no rules, never a false match"
+    check(existing_rules("t", _Unreadable()) is None,
+          "a table Describe cannot read is unreadable, never an empty rule list"
           "  <-- pinned defect")
 
     check(existing_rules("t", _FakeArcpy([_LiveRule("ar_N", "F", None)]))
@@ -787,42 +945,68 @@ def self_test():
           == ("INSERT", "UPDATE"),
           "live triggers sort, so arcpy's order is not a difference"
           "  <-- pinned defect")
+    check(normalize_live_triggers("esriARTEUpdate;esriARTEInsert")
+          == ("INSERT", "UPDATE"),
+          "a triggeringEvents string is split on its delimiter, not by letter"
+          "  <-- pinned defect")
     check(normalize_live_triggers(None) is None,
           "a rule exposing no triggeringEvents is unknown, not empty"
           "  <-- pinned defect")
 
-    decl = {"field": "LEFTZIP", "triggers": ("INSERT",)}
-    check(rule_diffs(decl, {"field": "LEFTZIP", "triggers": ("INSERT",)}) == [],
+    decl = {"name": "ar_Z", "field": "ZONE_L", "triggers": ("INSERT",)}
+    check(rule_diffs(decl, {"field": "ZONE_L", "triggers": ("INSERT",)}) == [],
           "a matching field and trigger is no difference")
-    check(rule_diffs(decl, {"field": "LeftZip", "triggers": ("INSERT",)}) == [],
+    check(rule_diffs(decl, {"field": "Zone_L", "triggers": ("INSERT",)}) == [],
           "Describe echoing the stored field case is no difference"
           "  <-- pinned defect")
-    check(rule_diffs(decl, {"field": None, "triggers": ("INSERT",)}) == [],
-          "a rule exposing no field name is no field difference")
-    d = rule_diffs(decl, {"field": "RIGHTZIP", "triggers": ("INSERT",)})
-    check(len(d) == 1 and "RIGHTZIP" in d[0],
+    d = rule_diffs(decl, {"field": None, "triggers": ("INSERT",)})
+    check(len(d) == 1 and "UNKNOWN" in d[0],
+          "a rule exposing no field name is UNKNOWN, never a match"
+          "  <-- pinned defect")
+    d = rule_diffs(decl, {"field": "ZONE_L", "triggers": ("INSERT",),
+                          "enabled": False})
+    check(len(d) == 1 and "disabled" in d[0],
+          "a disabled rule is a difference even when everything else matches"
+          "  <-- pinned defect")
+    check(rule_diffs(decl, {"field": "ZONE_L", "triggers": ("INSERT",),
+                            "enabled": True}) == [],
+          "an enabled rule is no difference")
+    d = rule_diffs(decl, {"name": "AR_Z", "field": "ZONE_L",
+                          "triggers": ("INSERT",)})
+    check(len(d) == 1 and "AR_Z" in d[0],
+          "a live rule that differs only in name case is a difference"
+          "  <-- pinned defect")
+    d = rule_diffs(decl, {"field": "ZONE_L", "triggers": ("INSERT",),
+                          "batch": True})
+    check(len(d) == 1 and "batch" in d[0],
+          "a rule living as a batch rule is a difference  <-- pinned defect")
+    disabled = _FakeArcpy([_LiveRule("ar_E", "F", [], enabled=False)])
+    check(existing_rules("t", disabled)["AR_E"]["enabled"] is False,
+          "the live isEnabled is read")
+    d = rule_diffs(decl, {"field": "ZONE_R", "triggers": ("INSERT",)})
+    check(len(d) == 1 and "ZONE_R" in d[0],
           "a rule bound to another field is a difference  <-- pinned defect")
-    d = rule_diffs(decl, {"field": "LEFTZIP", "triggers": ("UPDATE",)})
+    d = rule_diffs(decl, {"field": "ZONE_L", "triggers": ("UPDATE",)})
     check(len(d) == 1 and "UPDATE" in d[0],
           "a rule switched from INSERT to UPDATE is a difference"
           "  <-- pinned defect")
     check(rule_diffs({"field": "F", "triggers": ("UPDATE", "INSERT")},
                      {"field": "F", "triggers": ("INSERT", "UPDATE")}) == [],
           "declared trigger order is no difference either")
-    d = rule_diffs(decl, {"field": "LEFTZIP", "triggers": None})
+    d = rule_diffs(decl, {"field": "ZONE_L", "triggers": None})
     check(len(d) == 1 and "UNKNOWN" in d[0],
           "unreadable triggers report UNKNOWN, never equal-to-empty"
           "  <-- pinned defect")
 
     vplan = plan(load_rules(write(
-        [{"table": "CENTERLINE", "name": "ar_LEFTZIP", "field": "LEFTZIP",
+        [{"table": "STREETS", "name": "ar_ZONE_L", "field": "ZONE_L",
           "triggers": "INSERT", "script": "return 1;"},
-         {"table": "CENTERLINE", "name": "ar_RIGHTZIP", "field": "RIGHTZIP",
+         {"table": "STREETS", "name": "ar_ZONE_R", "field": "ZONE_R",
           "triggers": "INSERT", "script": "return 1;"}],
         "verify.json")), "")
 
-    clean = _FakeArcpy([_LiveRule("ar_LEFTZIP", "LeftZip", ["esriARTEInsert"]),
-                        _LiveRule("ar_RIGHTZIP", "RIGHTZIP",
+    clean = _FakeArcpy([_LiveRule("ar_ZONE_L", "Zone_L", ["esriARTEInsert"]),
+                        _LiveRule("ar_ZONE_R", "ZONE_R",
                                   ["esriARTEInsert"])])
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -830,12 +1014,12 @@ def self_test():
     check(clean_ok is True,
           "two correct rules verify clean, so --verify exits 0")
 
-    # The disaster: a colleague moves ar_LEFTZIP to UPDATE while chasing a slow
+    # The disaster: a colleague moves ar_ZONE_L to UPDATE while chasing a slow
     # insert, and binds the neighbouring rule to the wrong field. Both survive
     # a name-only check.
-    drifted = _FakeArcpy([_LiveRule("ar_LEFTZIP", "LEFTZIP",
+    drifted = _FakeArcpy([_LiveRule("ar_ZONE_L", "ZONE_L",
                                     ["esriARTEUpdate"]),
-                          _LiveRule("ar_RIGHTZIP", "LEFTZIP",
+                          _LiveRule("ar_ZONE_R", "ZONE_L",
                                     ["esriARTEInsert"])])
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -847,8 +1031,8 @@ def self_test():
           "two rules with different defects both report in one run")
 
     # A rule deleted outright, beside one this file does not manage.
-    gone = _FakeArcpy([_LiveRule("ar_RIGHTZIP", "RIGHTZIP", ["esriARTEInsert"]),
-                       _LiveRule("ar_STRAY", "LEFTZIP", ["esriARTEInsert"])])
+    gone = _FakeArcpy([_LiveRule("ar_ZONE_R", "ZONE_R", ["esriARTEInsert"]),
+                       _LiveRule("ar_STRAY", "ZONE_L", ["esriARTEInsert"])])
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         gone_ok = verify(vplan, "ws", gone)
@@ -856,7 +1040,7 @@ def self_test():
           "a deleted rule still fails verify  <-- pinned defect")
     check("[FAIL] MISSING" in buf.getvalue(),
           "a deleted rule reports MISSING, not DIFF")
-    check("[warn]" in buf.getvalue() and "AR_STRAY" in buf.getvalue(),
+    check("[warn]" in buf.getvalue() and "ar_STRAY" in buf.getvalue(),
           "a rule this file does not manage is a warning, not a failure")
 
     # Same false green one table up: no table, so no rule can be checked.
@@ -955,8 +1139,10 @@ def self_test():
     check("1 of 3. ar_LEGACY" in text and "3 of 3. ar_ZONE" in text,
           "the warning gives each rule its position among all rules on the "
           "table")
-    check("already on the table" in text and "from the rules file" in text,
-          "the warning says which rule is live and which is being deployed")
+    check("1 of 3. ar_LEGACY on INSERT, already on the table" in text
+          and "3 of 3. ar_ZONE on INSERT;UPDATE, from the rules file" in text,
+          "each rule's own line says whether it is live or being deployed"
+          "  <-- pinned defect")
     check("on INSERT they run ar_LEGACY, then ar_ZONE" in text,
           "the warning states the order on the shared event")
     check("No winner is claimed" in text and "wins" not in text
@@ -966,13 +1152,19 @@ def self_test():
         rule("ar_A", "ZONE", None, source="live"),
         rule("ar_B", "ZONE", ("INSERT",)),
         rule("ar_BAT", "ZONE", ("UPDATE",), True, "live")], False))
-    check("UNKNOWN: a live rule exposed no evaluationOrder" in text
+    check("UNKNOWN: the live evaluation order could not be read" in text
           and "?. ar_B" in text,
           "an unknown order prints no position rather than a guessed one")
     check("UNKNOWN events" in text and "batch. ar_BAT" in text,
           "unknown events and batch rules are labelled, not numbered")
     check(collision_lines("T", [rule("ar_A", "ZONE", ("INSERT",))], True)
           == [], "one rule per field prints nothing")
+    text = "\n".join(collision_lines("T", [
+        rule("ar_A", "ZONE", ("INSERT",)),
+        rule("ar_BAT", "ZONE", (), True, "live")], True))
+    check("batch. ar_BAT on no events, already on the table" in text,
+          "a batch rule with no events is labelled, not printed as 'on ,'"
+          "  <-- pinned defect")
 
     # ---- argument handling
     check(_parse(["--self-test"]).self_test, "--self-test parses")
@@ -1011,9 +1203,11 @@ def self_test():
         def __init__(self, gdb):
             self.gdb = gdb
             self.writes = 0
+            self.descriptions = []
+            self.events = []
 
         def DeleteAttributeRule(self, path, name, rtype):
-            rules = self.gdb.rules.get(os.path.basename(path), [])
+            rules = self.gdb.rules.get(os.path.basename(path).upper(), [])
             for r in rules:
                 if r.name == name:
                     self.writes += 1
@@ -1027,9 +1221,11 @@ def self_test():
             if "BROKEN" in script_expression:
                 raise RuntimeError("the Arcade did not compile")
             self.writes += 1
-            self.gdb.rules.setdefault(os.path.basename(in_table), []).append(
+            self.descriptions.append(description)
+            self.events.append(triggering_events)
+            self.gdb.rules.setdefault(os.path.basename(in_table).upper(), []).append(
                 _LiveRule(name, field, ["esriARTE" + t.capitalize()
-                                        for t in triggering_events]))
+                                        for t in triggering_events.split(";")]))
 
     class _Gdb(object):
         def __init__(self, tables, refs=(), reachable=True):
@@ -1040,16 +1236,17 @@ def self_test():
             self.management = _Management(self)
 
         def Exists(self, path):
-            name = os.path.basename(path)
-            if name == "ws":
+            # Table names ignore case here as they do in ArcGIS.
+            name = os.path.basename(path).upper()
+            if name == "WS":
                 return self.reachable
             return name in self.tables or name in self.refs
 
         def ListFields(self, path):
-            return self.tables[os.path.basename(path)]
+            return self.tables[os.path.basename(path).upper()]
 
         def Describe(self, path):
-            rules = self.rules.get(os.path.basename(path), [])
+            rules = self.rules.get(os.path.basename(path).upper(), [])
             for i, r in enumerate(rules):
                 r.evaluationOrder = i + 1
             return _Desc(rules)
@@ -1076,6 +1273,7 @@ def self_test():
     gdb.rules["SITES"] = [_LiveRule("ar_ZONE", "ZONE", ["esriARTEInsert"]),
                           _LiveRule("ar_LEGACY", "ZONE", ["esriARTEInsert"])]
     ok, out = run(preflight, zplan, "ws", gdb)
+    predicted = re.findall(r"\d of \d\. (\S+)", out)
     check(ok is True and "[FAIL]" not in out,
           "a clean workspace passes preflight with a collision on it")
     check("[warn] COLLISION on SITES.ZONE: 3 rules" in out,
@@ -1094,12 +1292,24 @@ def self_test():
     check("replaced existing ar_ZONE" in out and "ADDED 2 rule(s), 0 failed"
           in out, "apply reports the replacement and the count")
     ok, out = run(verify, zplan, "ws", gdb)
-    check(ok is True and "1 of 3. ar_LEGACY" in out
-          and "3 of 3. ar_ZONE_FIX" in out,
+    check(ok is True and predicted == ["ar_LEGACY", "ar_ZONE", "ar_ZONE_FIX"]
+          and re.findall(r"\d of \d\. (\S+)", out) == predicted,
           "verify reads the live order back and it matches the prediction")
     check("on INSERT they run ar_LEGACY, then ar_ZONE, then ar_ZONE_FIX" in out
-          and "unmanaged calculation rule: AR_LEGACY" in out,
+          and "unmanaged calculation rule: ar_LEGACY" in out,
           "verify reports the collision and the unmanaged rule, and passes")
+
+    check(gdb.management.events == ["INSERT;UPDATE", "INSERT"],
+          "apply passes the triggering events as the documented String"
+          "  <-- pinned defect")
+    check(gdb.management.descriptions == [None, None],
+          "an empty description is passed as None")
+    desc_gdb = sites()
+    run(apply_rules, plan(load_rules(write(
+        [{"table": "SITES", "name": "ar_D", "field": "ZONE", "script": "1",
+          "description": "sets the zone"}], "desc.json")), ""), "ws", desc_gdb)
+    check(desc_gdb.management.descriptions == ["sets the zone"],
+          "a description is passed through to the rule")
 
     broken = plan(load_rules(write(
         [{"table": "SITES", "name": "ar_BAD", "field": "ZONE",
@@ -1107,6 +1317,83 @@ def self_test():
     failed_apply, out = run(apply_rules, broken, "ws", sites())
     check(failed_apply == 1 and "[FAIL] could not add ar_BAD" in out,
           "a rule ArcGIS refuses is counted as failed, not added")
+
+    # Each failure alone must turn preflight red. Together in one plan they
+    # hide one another, so a check that cannot fail would go unseen.
+    def lone(table, name, field, script):
+        return plan(load_rules(write(
+            [{"table": table, "name": name, "field": field, "script": script}],
+            "lone.json")), "")
+
+    ok, out = run(preflight, lone("SITES", "ar_1", "ZONE",
+                                  'FeatureSetByName($datastore, "GONE", [], 1)'),
+                  "ws", sites())
+    check(ok is False and "MISSING: GONE" in out,
+          "a missing referenced dataset alone fails preflight"
+          "  <-- pinned defect")
+    ok, out = run(preflight, lone("GHOST", "ar_2", "ZONE", "1"), "ws", sites())
+    check(ok is False and "target table missing: GHOST" in out,
+          "a missing target table alone fails preflight  <-- pinned defect")
+    ok, out = run(preflight, lone("SITES", "ar_3", "ZONE", "1"), "ws",
+                  _Gdb({"SITES": [_Field("Zone")]}))
+    check(ok is False and "no GlobalID field on SITES" in out,
+          "a missing GlobalID alone fails preflight  <-- pinned defect")
+    ok, out = run(preflight, lone("SITES", "ar_4", "NOPE", "1"), "ws", sites())
+    check(ok is False and "target field missing: SITES.NOPE" in out,
+          "a missing target field alone fails preflight")
+    ok, out = run(preflight, lone("SITES", "ar_5", "zone", "1"), "ws", sites())
+    check(ok is True and "target field exists: SITES.zone" in out,
+          "a field written in another case than the stored one is found"
+          "  <-- pinned defect")
+    ok, out = run(preflight, lone("SITES", "ar_6", "ZONE",
+                                  'FeatureSetByName($datastore, "ZONES_" + y)'),
+                  "ws", sites())
+    check(ok is True and "ar_6 builds a dataset name at run time" in out,
+          "a joined dataset name is a dynamic warning, not a false pass"
+          "  <-- pinned defect")
+
+    # Two spellings of one table are one table, so their rules are compared.
+    cased = plan(load_rules(write(
+        [{"table": "Sites", "name": "ar_A", "field": "ZONE", "script": "1"},
+         {"table": "SITES", "name": "ar_B", "field": "ZONE", "script": "1"}],
+        "cased.json")), "")
+    ok, out = run(preflight, cased, "ws", sites())
+    check(ok is True and "COLLISION on Sites.ZONE: 2 rules" in out
+          and out.count("target table exists") == 1,
+          "rules on Sites and SITES are compared as one table"
+          "  <-- pinned defect")
+
+    # A live rule in another case blocks the replace: delete is case-exact.
+    shout = sites()
+    shout.rules["SITES"] = [_LiveRule("AR_ZONE", "ZONE", ["esriARTEInsert"])]
+    ok, out = run(preflight, lone("SITES", "ar_ZONE", "ZONE", "1"), "ws",
+                  shout)
+    check(ok is False and "differs only in case from the live rule AR_ZONE"
+          in out, "preflight fails a rule name that differs only in case from "
+          "a live one  <-- pinned defect")
+
+    # A table Describe cannot read is not a table with no rules.
+    class _Blind(_Gdb):
+        def Describe(self, path):
+            raise RuntimeError("cannot open")
+
+    blind = _Blind({"SITES": [_Field("GlobalID", "GlobalID"), _Field("Zone")]})
+    ok, out = run(preflight, cased, "ws", blind)
+    check("could not be read" in out and "UNKNOWN" in out and "?. ar_A" in out
+          and "1 of" not in out,
+          "unreadable live rules are reported UNKNOWN, with no guessed order"
+          "  <-- pinned defect")
+    ok, out = run(verify, cased, "ws", blind)
+    check(ok is False and "cannot read the rules on Sites" in out,
+          "verify fails when the live rules cannot be read")
+
+    # A disabled or field-less live rule must not verify as correct.
+    off = sites()
+    off.rules["SITES"] = [_LiveRule("ar_ZONE", "ZONE", ["esriARTEInsert"],
+                                    enabled=False)]
+    ok, out = run(verify, lone("SITES", "ar_ZONE", "ZONE", "1"), "ws", off)
+    check(ok is False and "disabled" in out,
+          "verify fails a rule that is present but disabled")
 
     ok, out = run(preflight, zplan, "ws", _Gdb({}, reachable=False))
     check(ok is False and "cannot reach workspace" in out,
@@ -1275,7 +1562,7 @@ def _parse(argv):
                          "Env: ARCADE_RULE_WORKSPACE")
     ap.add_argument("--qualifier", default=os.environ.get("ARCADE_RULE_QUALIFIER", ""),
                     help="database qualifier prefixed to unqualified names, "
-                         'e.g. "GISOWNER." Env: ARCADE_RULE_QUALIFIER')
+                         'e.g. "OWNER." Env: ARCADE_RULE_QUALIFIER')
     ap.add_argument("--apply", action="store_true",
                     help="add the rules. Without this nothing is written.")
     ap.add_argument("--verify", action="store_true",

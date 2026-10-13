@@ -6,9 +6,11 @@ Rules live in a JSON file. The default run checks and writes nothing. Adding rul
 `--apply`, and re-running replaces rather than stacks, so the same command is safe twice.
 
 The check that earns this tool: every `FeatureSetByName("...")` reference inside every script
-is resolved against the target workspace first. ArcGIS accepts a rule whose referenced layer
-does not exist. Nothing complains when you add it. The rule then returns empty at run time and
-quietly writes wrong values into production.
+is resolved against the target workspace before anything is written. Measured on ArcGIS Pro 3.6
+with a file geodatabase, `AddAttributeRule` refuses a rule whose table is missing (`ERROR 002717:
+Invalid Arcade expression, Arcade error: Table not found`). A batch without this check dies part
+way. Whether an enterprise geodatabase refuses it at add time was not measured, and the Esri
+function reference does not say what a missing layer returns. The check costs nothing either way.
 
 The second check: two rules that write the same field. ArcGIS runs them one after the other, in
 an evaluation order that the rules file does not show, and a re-deploy can change that order.
@@ -43,7 +45,7 @@ PASS  verify reads the live order back and it matches the prediction
 ...
 PASS  importing the module prints nothing and exposes the core
 ------------------------------------------------------------------
-127 assertions, 0 failed
+165 assertions, 0 failed
 ```
 
 ## Requirements
@@ -57,7 +59,7 @@ ArcGIS Pro's Python for a real run, because attribute rules need `arcpy`:
 `--self-test` needs none of that. It is pure Python 3.9 or newer and runs on any interpreter, so
 you can check the tool before you have a geodatabase to point it at. Nothing to install either way.
 
-The self-test prints the same 127 assertions on Windows (Python 3.13), on Python 3.9.25 and on
+The self-test prints the same 165 assertions on Windows (Python 3.13), on Python 3.9.25 and on
 Ubuntu (Python 3.12.3), and the outputs are identical line for line.
 `coverage run --branch arcade_rule_deploy.py --self-test` reports 100 percent of lines and
 branches. The arcpy side runs against a geodatabase held in memory that keeps evaluation order the
@@ -101,7 +103,7 @@ python arcade_rule_deploy.py --rules rules.json --workspace prod.sde --verify
 |---|---|---|
 | `--rules` | none | JSON file describing the rules. Required. |
 | `--workspace` | `$ARCADE_RULE_WORKSPACE` | Target `.gdb` or `.sde`. Required. |
-| `--qualifier` | `$ARCADE_RULE_QUALIFIER`, else blank | Prefix for unqualified names, e.g. `GISOWNER.` |
+| `--qualifier` | `$ARCADE_RULE_QUALIFIER`, else blank | Prefix for unqualified names, e.g. `OWNER.` |
 | `--apply` | off | Add the rules. Without it nothing is written. |
 | `--verify` | off | Report whether each rule is present, on its declared field, firing on its declared triggers. Writes nothing. |
 | `--self-test` | off | Run the offline assertions and exit. |
@@ -127,8 +129,9 @@ This was measured on ArcGIS Pro 3.6, on a scratch file geodatabase:
 
 Esri documents the mechanism. "The evaluation order is initially determined by the order in
 which rules are created for a dataset", and "the order increases by one as new rules are
-created" ([Calculation attribute rules][calc]). A delete closes the gap. So a re-added rule runs
-last, behind every rule it used to precede.
+created" ([Calculation attribute rules][calc]). That a delete closes the gap is measured, not
+documented: the Esri page does not say it. So a re-added rule runs last, behind every rule it
+used to precede.
 
 The re-run's preflight prints this before it writes anything. `--verify` prints the same order
 afterwards, read from the live table:
@@ -161,15 +164,17 @@ How the order is predicted:
    batch rules "independently maintain their own evaluation order" ([Calculation attribute
    rules][calc]), and batch rules run when rules are evaluated, not when you edit.
 
-`--verify` reads the real order back after `--apply`, so a wrong prediction would show there.
-On the run above, both printed the same order.
+`--verify` prints the order read back from the live table after `--apply`. It does not compare
+that order with the prediction, and its exit code does not depend on it. You compare the two
+printouts. On a 4-rule run against real arcpy 3.6, both printed the same order. The self-test
+makes the same comparison against an in-memory geodatabase.
 
 ## What already exists
 
 - The **Attribute Rules view** in ArcGIS Pro shows calculation rules in evaluation order, in
   separate Immediate and Batch sections, and lets you edit the Order column ([Calculation
-  attribute rules][calc]). It is the best way to look at one table. It does not warn when two
-  rules write the same field.
+  attribute rules][calc]). It is the best way to look at one table. The Esri documentation does
+  not describe a warning when two rules write the same field.
 - **Reorder Attribute Rule** sets a rule's position ([Reorder Attribute Rule][reorder]). After a
   collision report it is the fix, if the order is wrong.
 - **Export Attribute Rules** and **Import Attribute Rules** move rules between datasets as CSV.
@@ -185,7 +190,7 @@ On the run above, both printed the same order.
 `--verify` reads the rules already on each table and compares three things against the rules
 file: the name, the field the rule writes, and the events it fires on. A name-only check is the
 one that fails you in practice, because the rule that goes wrong is one somebody edited in
-place. A colleague chasing a slow insert moves `ar_LEFTZIP` from INSERT to UPDATE. The rule is
+place. A colleague chasing a slow insert moves `ar_ZONE_L` from INSERT to UPDATE. The rule is
 still there, still carrying the right Arcade, and it no longer fires on the insert that creates
 a centerline. Any check that asks only whether the name is present reports that as healthy.
 
@@ -213,7 +218,7 @@ without `--apply`, and no environment variable can turn writing on.
 `--qualifier` is what lets one rules file target two databases. Names already containing a dot
 are left alone, so unqualified names pick up the prefix and qualified ones do not. Point the
 same file at a local test geodatabase with no qualifier, then at an enterprise one with
-`--qualifier GISOWNER.`, without editing a script.
+`--qualifier OWNER.`, without editing a script.
 
 ## What preflight checks
 
@@ -226,16 +231,19 @@ same file at a local test geodatabase with no qualifier, then at an enterprise o
 6. Rule names are unique per table, triggers are valid, and no required key is missing.
 7. Two rules that write the same field on the same event get a warning. The warning gives the
    evaluation order after `--apply` and names no winner. See "Two rules on one field".
+8. No live rule has the name of a file rule in another case. ArcGIS refuses a duplicate name
+   without regard to case, yet deletes only by exact case (`ERROR 002541` on the add, `ERROR
+   002556` on the delete, measured on Pro 3.6), so apply could neither replace nor add it.
 
 A script that builds a dataset name at run time is reported as unchecked rather than passed
 silently, because there is nothing to resolve ahead of time.
 
 ## Why the obvious version is wrong
 
-`AddAttributeRule` validates the Arcade syntax, not the world the script runs in. A rule
-referencing `ZIPCODES` when the table is really `GISOWNER.ZIPCODES` is added without complaint.
-`FeatureSetByName` then returns an empty set, `First()` returns null, and a rule written to fall
-back to the existing value silently keeps stale data while looking like it ran.
+A rule referencing `ZIPCODES` when the table is really `OWNER.ZIPCODES` is a name mistake that
+only a check against the workspace catches. A file geodatabase refuses it at add time. What an
+enterprise geodatabase does with it was not measured. If one accepted it, a rule written to fall
+back to the existing value would silently keep stale data while looking like it ran.
 
 Applying rules one at a time by hand has the same problem in a different place: a batch that
 dies on rule 7 of 12 leaves the table half configured, and the obvious retry adds duplicates of
@@ -264,6 +272,35 @@ the first six. Deleting a same-named rule before adding it makes the whole run r
 - The evaluation order was measured on ArcGIS Pro 3.6 against a file geodatabase only. The
   enterprise geodatabase and the batch rule handling follow Esri's documentation and were not
   measured.
+- Exit code 1 means "preflight or verify failed". It also means the tool stopped: arcpy was
+  missing, or arcpy raised an error the tool does not catch, such as a permission error on a
+  table. Read the output, because a wrapper script cannot tell these apart.
+- If an add fails, the rule it was replacing is already deleted and is not restored. Preflight
+  does not compile the Arcade, so a bad edit to an existing rule can remove the working rule on
+  `--apply`. Export the rules first, then fix the script and run again.
+- The predicted order assumes every add succeeds. `--verify` shows the order that resulted.
+- A failed delete is not reported on its own. The tool continues, and the failure shows only as
+  the error from the add that follows.
+- The reference scan uses regular expressions and does not parse Arcade. It strips `//` and
+  `/* */` comments and treats a dataset name joined to anything else as dynamic. Only the exact
+  spelling `FeatureSetByName` is inspected, and Esri does not say whether Arcade function names
+  are case-insensitive.
+- `table`, `name`, `field` and `script` must be JSON strings. Any other type is refused with exit
+  64. A `table` with a drive or a leading slash is refused too, because it would send the write
+  to another geodatabase than `--workspace`.
+- Save the rules file as UTF-8. A BOM is accepted. UTF-16, which PowerShell 5 `Out-File` writes,
+  is refused with the message "not valid JSON (it must be UTF-8)". A duplicate JSON key is not
+  detected, and the last value wins.
+- Esri documents `triggering_events` as a String such as `INSERT;UPDATE`, and the tool passes
+  that form. Pro 3.6 also accepted a Python list, and `Describe` returned a list.
+- In the collision report, the "N of M" position counts every immediate calculation rule on the
+  table, including rules on other fields. A live rule whose field cannot be read is left out of
+  the report without a marker. A batch rule is listed without events or a position.
+- An unreadable live rule list is reported as UNKNOWN in preflight and fails `--verify`.
+  Preflight still exits 0 in that case, because a collision is a warning, so read its output.
+- Output is printed in the console encoding. With non-ASCII names, redirected output on a
+  Windows code page can raise `UnicodeEncodeError`. Use ASCII names or set
+  `PYTHONIOENCODING=utf-8`.
 
 ## Contributing
 
